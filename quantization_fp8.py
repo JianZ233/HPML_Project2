@@ -5,8 +5,9 @@ def apply_fp8_quantization(model):
         param.data = _to_fp8(param.data)
     print("FP8 quantization applied.")
 
+
 def _to_fp8(tensor):
     """Convert tensor to FP8 format."""
     # Placeholder for real FP8 conversion
-    fp8_tensor = tensor.half()  # Simulate FP8 with FP16
+    fp8_tensor = tensor.half()  # Simulate FP8 with FP16 for now
     return fp8_tensor

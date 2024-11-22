@@ -3,6 +3,8 @@ from quantization_fp8 import apply_fp8_quantization
 from quantization_gptq import apply_gptq_quantization
 from memory_alignment import validate_memory_alignment
 from ibm_fms_integration import test_with_ibm_fms
+from quantized_dataloader import create_dataloader, QuantizationType
+
 
 class GenericModelLoader:
     def __init__(self, quantization_format="FP8", device="cuda"):
@@ -34,10 +36,15 @@ class GenericModelLoader:
         """Integrate and test model with IBM FMS."""
         test_with_ibm_fms(self.model)
 
-# Example usage
+
 if __name__ == "__main__":
     loader = GenericModelLoader(quantization_format="FP8")
     loader.load_checkpoint("path/to/checkpoint.pth")
     loader.apply_quantization()
     loader.validate_memory_alignment()
     loader.test_with_ibm_fms()
+
+    # Eg: Create a dataloader for additional quantized data
+    data = torch.randn(1000, 10)  # Example
+    loader, quant_params = create_dataloader(data, batch_size=32, quantization_type=QuantizationType.FP8)
+    print("Quantization parameters:", quant_params)
