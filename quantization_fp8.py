@@ -9,5 +9,6 @@ def apply_fp8_quantization(model):
 def _to_fp8(tensor):
     """Convert tensor to FP8 format."""
     # Placeholder for real FP8 conversion
+    #https://docs.vllm.ai/en/latest/quantization/fp8.html
     fp8_tensor = tensor.half()  # Simulate FP8 with FP16 for now
     return fp8_tensor

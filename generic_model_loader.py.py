@@ -1,5 +1,6 @@
 import torch
 from quantization_fp8 import apply_fp8_quantization
+from quantization_fp4 import apply_fp4_quantization
 from quantization_gptq import apply_gptq_quantization
 from memory_alignment import validate_memory_alignment
 from ibm_fms_integration import test_with_ibm_fms
@@ -23,6 +24,8 @@ class GenericModelLoader:
         """Apply the specified quantization format to the model."""
         if self.quantization_format == "FP8":
             apply_fp8_quantization(self.model)
+        elif self.quantization_format == "FP4":
+            apply_fp4_quantization(self.model)
         elif self.quantization_format == "GPTQ":
             apply_gptq_quantization(self.model)
         else:
@@ -44,7 +47,7 @@ if __name__ == "__main__":
     loader.validate_memory_alignment()
     loader.test_with_ibm_fms()
 
-    # Eg: Create a dataloader for additional quantized data
+    # Example
     data = torch.randn(1000, 10)  # Example
-    loader, quant_params = create_dataloader(data, batch_size=32, quantization_type=QuantizationType.FP8)
+    dataloader, quant_params = create_dataloader(data, batch_size=32, quantization_type=QuantizationType.FP8)
     print("Quantization parameters:", quant_params)

@@ -5,17 +5,16 @@ from enum import Enum
 
 
 class QuantizationType(Enum):
-    FP32 = 'fp32'
-    FP16 = 'fp16'
     FP8 = 'fp8'
-    INT8 = 'int8'
+    FP4 = 'fp4'
+    GPTQ = 'gptq'
 
 
 class QuantizedDataset(Dataset):
     def __init__(
         self,
         data: torch.Tensor,
-        quantization_type: QuantizationType = QuantizationType.FP32,
+        quantization_type: QuantizationType = QuantizationType.FP8,
         calibration_size: int = 1000
     ):
         self.original_data = data
@@ -39,9 +38,8 @@ class QuantizedDataset(Dataset):
         calibration_data = self.original_data[self.calibration_indices]
         data_min, data_max = torch.min(calibration_data), torch.max(calibration_data)
 
-        if self.quantization_type == QuantizationType.INT8:
-            self.scale = (data_max - data_min) / 255.0
-            self.zero_point = -round(data_min / self.scale)
+        if self.quantization_type == QuantizationType.FP4:
+            self.scale = torch.max(torch.abs(data_min), torch.abs(data_max)) / 15.0
         elif self.quantization_type == QuantizationType.FP8:
             self.scale = torch.max(torch.abs(data_min), torch.abs(data_max)) / 127.0
 
@@ -55,14 +53,10 @@ class QuantizedDataset(Dataset):
 
     def _quantize(self, data: torch.Tensor) -> torch.Tensor:
         """Quantize input data."""
-        if self.quantization_type == QuantizationType.FP32:
-            return data
-        elif self.quantization_type == QuantizationType.FP16:
-            return data.half()
-        elif self.quantization_type == QuantizationType.INT8:
-            return torch.clamp(torch.round(data / self.scale) + self.zero_point, 0, 255).to(torch.uint8)
-        elif self.quantization_type == QuantizationType.FP8:
+        if self.quantization_type == QuantizationType.FP8:
             return torch.clamp(data / self.scale, -127, 127)
+        elif self.quantization_type == QuantizationType.FP4:
+            return torch.clamp(torch.round(data / self.scale), -15, 15).to(torch.int8)
         else:
             raise ValueError(f"Unsupported quantization type: {self.quantization_type}")
 
@@ -70,7 +64,7 @@ class QuantizedDataset(Dataset):
 def create_dataloader(
     data: torch.Tensor,
     batch_size: int = 32,
-    quantization_type: QuantizationType = QuantizationType.FP32,
+    quantization_type: QuantizationType = QuantizationType.FP8,
     calibration_size: int = 1000
 ):
     """
