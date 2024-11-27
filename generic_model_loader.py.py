@@ -48,6 +48,6 @@ if __name__ == "__main__":
     loader.test_with_ibm_fms()
 
     # Example
-    data = torch.randn(1000, 10)  # Example
+    data = torch.randn(1000, 10)
     dataloader, quant_params = create_dataloader(data, batch_size=32, quantization_type=QuantizationType.FP8)
     print("Quantization parameters:", quant_params)
