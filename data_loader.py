@@ -28,7 +28,7 @@ def load_fp8_model(file_path):
     Load an FP8 model, ensuring compatibility with hardware and proper byte alignment.
     """
     if not _is_sm89_or_later():
-        raise RuntimeError("FP8 requires SM89+ GPU architecture (e.g., H100).")
+        raise RuntimeError("FP8 requires SM89+ GPU architecture (e.g., H100, L40).")
 
     try:
         from torchao.float8 import CastConfig, Float8LinearConfig, ScalingType
