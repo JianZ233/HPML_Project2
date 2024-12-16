@@ -481,25 +481,122 @@ class ShardedFP8ModelLoader:
             model = model.cpu()
     
             if self.memory_efficient:
-                # Convert parameters to meta tensors
                 self._convert_to_meta(model)
     
-            # Load and process weights
+            # Load weights from file
             weights = load_file(checkpoint_path)
     
-            # Optional: Filter out unwanted scale keys if they're not used
-            # For example, keys ending with "input_scale" or "weight_scale"
+            # Remove filtering out scale keys for debugging:
             weights = {k: v for k, v in weights.items() 
                        if not (k.endswith('input_scale') or k.endswith('weight_scale'))}
     
-            # Handle key prefix adjustments if needed
+            # Do not force 'model.' prefix:
             processed_weights = {}
             for key, value in weights.items():
-                if not key.startswith('model.'):
-                    key = f'model.{key}'
                 processed_weights[key] = value
     
             # Create shard mapping
+            shard_mapping = self._create_shard_mapping(processed_weights)
+    
+            # Load on CPU first
+            load_device = torch.device('cpu')
+            self.async_loader.start_prefetch(shard_mapping, self.fp8_handler, load_device)
+    
+            while True:
+                shard = self.async_loader.get_next_shard()
+                if shard is None:
+                    break
+    
+                shard_id, shard_weights = shard
+                self._load_shard_weights(model, shard_weights, device=load_device)
+                self.async_loader.advance()
+    
+                if self.memory_efficient:
+                    torch.cuda.empty_cache()
+                    gc.collect()
+    
+            # Ensure no meta tensors remain and move to GPU
+            self._ensure_no_meta_left(model, load_device)
+            model = self._distribute_model_across_gpus(model)
+    
+            if self.use_ddp and len(self.device_ids) > 1:
+                model = DDP(model, device_ids=[self.device_ids[0]])
+    
+            return model
+    
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            raise
+        finally:
+            self.async_loader.stop()
+
+    def load_model_from_weights(self, weights_dict: Dict[str, torch.Tensor]) -> nn.Module:
+        """
+        Load and initialize the model from a dictionary of weights (already loaded from shards).
+        Adjust keys to match the model's naming convention and merge FP8 scale keys into parameter dictionaries.
+        """
+        try:
+            # Load config and create model
+            config = AutoConfig.from_pretrained(self.model_dir)
+            model = AutoModelForCausalLM.from_config(config)
+            model = model.cpu()
+    
+            if self.memory_efficient:
+                self._convert_to_meta(model)
+
+            # ===========================================
+            # BEGIN MODIFICATIONS
+            # ===========================================
+            # The checkpoint provides keys like:
+            # "layers.0.mlp.down_proj.weight", "layers.0.mlp.down_proj.weight_scale", etc.
+            # We want to merge them into a single dictionary:
+            # "model.layers.0.mlp.down_proj": {"weight": ..., "scale": ...}
+            
+            merged_params = {}
+            for full_key, tensor in weights_dict.items():
+                # Example full_key: "layers.0.mlp.down_proj.weight"
+                parts = full_key.split('.')
+                
+                # Separate the attribute (last part) from the base key
+                attr = parts[-1]        # e.g., "weight", "weight_scale", "input_scale"
+                base_key = '.'.join(parts[:-1])  # e.g., "layers.0.mlp.down_proj"
+                
+                if base_key not in merged_params:
+                    merged_params[base_key] = {}
+                
+                if attr.endswith("_scale"):
+                    # This is a scale key
+                    # We'll just store it under 'scale'. If multiple scales appear, you may need logic
+                    # to decide which scale to use. For now, we assume there's only one relevant scale.
+                    # If there's both input_scale and weight_scale, you may pick one or combine them.
+                    merged_params[base_key]["scale"] = tensor
+                else:
+                    # This is likely the main weight tensor
+                    merged_params[base_key]["weight"] = tensor
+
+            # Now we have a dict of base_keys like "layers.0.mlp.down_proj" -> {"weight": ..., "scale": ...}
+            # We need to add the "model." prefix where appropriate.
+
+            processed_weights = {}
+            for base_key, param_dict in merged_params.items():
+                new_key = base_key
+                if new_key.startswith("embed_tokens."):
+                    new_key = "model." + new_key
+                elif new_key.startswith("layers."):
+                    new_key = "model." + new_key
+                elif new_key.startswith("norm."):
+                    new_key = "model." + new_key
+                # If the lm_head is top-level, you might leave it as is,
+                # or if needed:
+                # elif new_key == "lm_head":
+                #     new_key = "lm_head"  # or "model.lm_head" depending on your model structure.
+                
+                processed_weights[new_key] = param_dict
+            # ===========================================
+            # END MODIFICATIONS
+            # ===========================================
+    
+            # Create shard mapping from merged and processed weights
             shard_mapping = self._create_shard_mapping(processed_weights)
     
             # Load on CPU first
