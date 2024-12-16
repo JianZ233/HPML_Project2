@@ -8,6 +8,7 @@ import queue
 import threading
 from dataclasses import dataclass
 import numpy as np
+from safetensors.torch import load_file
 
 @dataclass
 class FP8Format:
@@ -61,44 +62,23 @@ class FP8QuantizationHandler:
     def __init__(self, fp8_format: Optional[FP8Format] = None):
         self.fp8_format = fp8_format or FP8Format()
         
-    def _quantize_to_fp8(self, fp32_tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Convert FP32 tensor to FP8 format."""
-        abs_max = torch.max(torch.abs(fp32_tensor)).item()
-        scale = abs_max / self.fp8_format.max_value
-        
-        scaled = fp32_tensor / scale
-        scaled = torch.clamp(scaled, -self.fp8_format.max_value, self.fp8_format.max_value)
-        
-        # Simulate FP8 quantization
-        if self.fp8_format.e4m3:
-            # e4m3: 4-bit exponent, 3-bit mantissa
-            exp_bits = 4
-            man_bits = 3
-        else:
-            # e5m2: 5-bit exponent, 2-bit mantissa
-            exp_bits = 5
-            man_bits = 2
-            
-        total_bits = exp_bits + man_bits + 1  # +1 for sign bit
-        
-        # Quantize to FP8 precision
-        quantum = 2.0 ** (-man_bits)
-        quantized = torch.round(scaled / quantum) * quantum
-        
-        return quantized, torch.tensor(scale)
-
     def load_quantized_weights(self, checkpoint_path: str) -> Dict[str, torch.Tensor]:
         """Load FP8 quantized weights with proper metadata."""
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
-        
-        if isinstance(checkpoint, dict) and 'model_state' in checkpoint:
-            weights = checkpoint['model_state']
-            if 'fp8_config' in checkpoint:
-                self.fp8_format = FP8Format(**checkpoint['fp8_config'])
-        else:
-            weights = checkpoint
+        try:
+            weights = load_file(checkpoint_path)
             
-        return weights
+            # Check if the weights include FP8 config
+            if 'fp8_config' in weights:
+                self.fp8_format = FP8Format(**weights['fp8_config'])
+                
+            # If weights are nested in model_state, extract them
+            if 'model_state' in weights:
+                weights = weights['model_state']
+                
+            return weights
+            
+        except Exception as e:
+            raise RuntimeError(f"Failed to load safetensors file: {e}")
 
     def dequantize_weights(self, quantized_weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Dequantize FP8 weights to FP16/FP32."""
@@ -112,9 +92,23 @@ class FP8QuantizationHandler:
             else:
                 quantized = tensor
                 scale = self.fp8_format.scale
-                
-            # Convert to FP16 for efficiency
-            dequantized[name] = (quantized * scale).to(torch.float16)
+
+            # First convert FP8 to FP32, then apply scaling
+            if quantized.dtype == torch.float8_e4m3fn:
+                # Convert to FP32 first
+                fp32_tensor = quantized.to(torch.float32)
+                # Apply scaling in FP32
+                scaled_tensor = fp32_tensor * scale
+                # Convert to FP16 for efficiency
+                dequantized[name] = scaled_tensor.to(torch.float16)
+            elif quantized.dtype == torch.float8_e5m2:
+                # Handle e5m2 format similarly
+                fp32_tensor = quantized.to(torch.float32)
+                scaled_tensor = fp32_tensor * scale
+                dequantized[name] = scaled_tensor.to(torch.float16)
+            else:
+                # For non-FP8 tensors, process normally
+                dequantized[name] = (quantized * scale).to(torch.float16)
             
         return dequantized
 
@@ -143,8 +137,66 @@ class ShardedFP8ModelLoader:
         if self.use_ddp and not dist.is_initialized():
             raise RuntimeError("Distributed environment not initialized, but use_ddp=True.")
 
+    def _get_available_devices(self) -> List[int]:
+        """Get list of available CUDA devices."""
+        if not torch.cuda.is_available():
+            return [0]  # CPU only
+        return list(range(torch.cuda.device_count()))
+
+    def _create_shard_mapping(self, weights: Dict[str, torch.Tensor]) -> Dict[int, Dict[str, torch.Tensor]]:
+        """Create mapping of weights to shards based on size constraints.
+        
+        Args:
+            weights: Dictionary of model weights
+            
+        Returns:
+            Dictionary mapping shard IDs to weight dictionaries
+        """
+        shard_mapping = {}
+        current_shard = {}
+        current_shard_size = 0
+        shard_id = 0
+        
+        # Sort weights by size for better distribution
+        sorted_weights = sorted(
+            weights.items(),
+            key=lambda x: x[1].numel() * x[1].element_size(),
+            reverse=True
+        )
+        
+        for name, tensor in sorted_weights:
+            tensor_size = tensor.numel() * tensor.element_size()
+            
+            # If tensor is larger than shard size, split it
+            if tensor_size > self.shard_size_bytes:
+                # Calculate number of splits needed
+                num_splits = int(np.ceil(tensor_size / self.shard_size_bytes))
+                splits = torch.chunk(tensor, num_splits)
+                
+                for i, split in enumerate(splits):
+                    split_name = f"{name}_split_{i}"
+                    shard_mapping[shard_id] = {split_name: split}
+                    shard_id += 1
+                continue
+            
+            # If adding tensor would exceed shard size, create new shard
+            if current_shard_size + tensor_size > self.shard_size_bytes and current_shard:
+                shard_mapping[shard_id] = current_shard
+                current_shard = {}
+                current_shard_size = 0
+                shard_id += 1
+            
+            current_shard[name] = tensor
+            current_shard_size += tensor_size
+        
+        # Add remaining weights to final shard
+        if current_shard:
+            shard_mapping[shard_id] = current_shard
+        
+        return shard_mapping
+
     def load_model(self, checkpoint_path: str) -> nn.Module:
-        """Enhanced model loading with async shard processing."""
+        """Enhanced model loading with async shard processing and meta tensor handling."""
         model = self.model_cls()
         fp8_weights = self.fp8_handler.load_quantized_weights(checkpoint_path)
         
@@ -156,7 +208,13 @@ class ShardedFP8ModelLoader:
         # Create shard mapping and start prefetch
         self.shard_mapping = self._create_shard_mapping(fp8_weights)
         primary_device = torch.device(f'cuda:{self.device_ids[0]}')
-        model.to(primary_device)
+        
+        # Handle meta tensors by using to_empty() first
+        try:
+            model.to_empty(device=primary_device)
+        except AttributeError:
+            # Fallback for models that don't support to_empty
+            model.to(primary_device)
         
         # Start async loading
         self.async_loader.start_prefetch(self.shard_mapping, self.fp8_handler, primary_device)
