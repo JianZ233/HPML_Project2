@@ -253,64 +253,68 @@ class ShardedFP8ModelLoader:
     def _convert_to_meta(self, model: nn.Module):
         """
         Convert model parameters to meta tensors with proper type handling.
-        
-        Args:
-            model: The model to convert
+        Replaces the parameters entirely rather than assigning .data.
         """
+        # We store a list of (parent, param_name, new_param) so we can set them after iteration
+        updates = []
         with torch.no_grad():
-            for name, param in model.named_parameters():
-                if not param.is_meta:
-                    try:
-                        # Get original dtype
-                        orig_dtype = param.dtype
-                        
-                        # Handle FP8 dtypes
-                        if str(orig_dtype).startswith('torch.float8'):
-                            meta_dtype = torch.float16
-                        else:
-                            meta_dtype = orig_dtype
-                        
-                        # Create meta tensor
-                        meta_param = torch.empty(
-                            param.shape,
-                            dtype=meta_dtype,
-                            device='meta'
-                        )
-                        
-                        # Store original properties
-                        param._original_dtype = orig_dtype
-                        param._original_device = param.device
-                        
-                        # Update parameter
-                        param.data = meta_param
-                        
-                    except Exception as e:
-                        print(f"Warning: Could not convert {name} to meta tensor. Error: {e}")
-                        continue
+            for full_name, param in list(model.named_parameters(recurse=True)):
+                # If already meta, skip
+                if param.is_meta:
+                    continue
+    
+                # Determine appropriate meta dtype
+                orig_dtype = param.dtype
+                # If FP8, revert to float16 for meta representation
+                if str(orig_dtype).startswith('torch.float8'):
+                    meta_dtype = torch.float16
+                else:
+                    meta_dtype = orig_dtype
+    
+                # Create a new parameter on meta device
+                new_param = nn.Parameter(
+                    torch.empty(param.shape, dtype=meta_dtype, device='meta'),
+                    requires_grad=param.requires_grad
+                )
+    
+                # Find the parent module and the attribute name
+                parent = model
+                attrs = full_name.split('.')
+                for attr in attrs[:-1]:
+                    parent = getattr(parent, attr)
+                param_name = attrs[-1]
+    
+                # Schedule the update
+                updates.append((parent, param_name, new_param))
+    
+        # Apply all updates
+        for parent, param_name, new_param in updates:
+            setattr(parent, param_name, new_param)
 
     def _ensure_no_meta_left(self, model: nn.Module, device: torch.device):
         """
         Ensure no parameters remain on meta device.
-        
-        Args:
-            model: The model to check
-            device: Target device for parameters
+        Replace meta parameters with new nn.Parameters on the target device.
         """
         with torch.no_grad():
-            for name, param in model.named_parameters():
-                if param.is_meta:
-                    # Get original dtype
-                    dtype = getattr(param, '_original_dtype', param.dtype)
-                    if str(dtype).startswith('torch.float8'):
-                        dtype = torch.float16
-                    
-                    # Create real tensor
-                    real_tensor = torch.empty(
-                        param.shape,
-                        dtype=dtype,
-                        device=device
-                    )
-                    param.data = real_tensor
+            named_params = list(model.named_parameters())
+        for full_name, param in named_params:
+            if param.is_meta:
+                # Determine appropriate dtype
+                dtype = getattr(param, '_original_dtype', param.dtype)
+                if str(dtype).startswith('torch.float8'):
+                    dtype = torch.float16
+    
+                # Create a real tensor on the target device
+                real_tensor = torch.empty(param.shape, dtype=dtype, device=device)
+                new_param = nn.Parameter(real_tensor, requires_grad=param.requires_grad)
+    
+                # Locate parent module
+                parent = model
+                parts = full_name.split('.')
+                for attr in parts[:-1]:
+                    parent = getattr(parent, attr)
+                setattr(parent, parts[-1], new_param)
 
     def _distribute_model_across_gpus(self, model: nn.Module) -> nn.Module:
         """
@@ -396,42 +400,71 @@ class ShardedFP8ModelLoader:
         
         for name, tensor in processed_weights.items():
             try:
-                # Get parameter through nested access
+                # Navigate through the model attributes to find the parameter
                 param = None
                 obj = model
-                for attr in name.split('.'):
+                parts = name.split('.')
+                for attr in parts[:-1]:
                     if hasattr(obj, attr):
                         obj = getattr(obj, attr)
-                        if isinstance(obj, nn.Parameter):
-                            param = obj
-                            break
                     else:
-                        unexpected_keys.append(name)
+                        # If any part of the path doesn't exist, it's unexpected
+                        param = None
                         break
-
-                if param is not None:
-                    # Handle FP8 conversion
-                    tensor = self.fp8_handler.optimize_memory_format(tensor)
-                    
-                    # Handle meta tensors
-                    if param.is_meta:
-                        param.data = torch.empty_like(tensor, device=device)
-                    
-                    # Update parameter
+                # Now obj should be the parent module, and parts[-1] should be the parameter name
+                if param is None:
+                    if hasattr(obj, parts[-1]) and isinstance(getattr(obj, parts[-1]), nn.Parameter):
+                        param = getattr(obj, parts[-1])
+                    else:
+                        # If the final attribute doesn't match a parameter, it's unexpected
+                        unexpected_keys.append(name)
+                        continue
+    
+                # Optimize memory format if using FP8
+                tensor = self.fp8_handler.optimize_memory_format(tensor)
+    
+                # Move the tensor to the correct device and ensure matching dtype
+                # If the parameter is meta, we must create a new Parameter
+                if param.is_meta:
+                    # Determine correct dtype for final parameter
+                    target_dtype = param.dtype
+                    if tensor.dtype != target_dtype:
+                        tensor = tensor.to(target_dtype)
+    
                     tensor = tensor.to(device)
-                    param.data.copy_(tensor)
-                    
-                    # Memory cleanup
-                    if self.memory_efficient:
-                        del tensor
-                        torch.cuda.empty_cache()
+                    new_param = nn.Parameter(tensor, requires_grad=param.requires_grad)
+    
+                    # Replace the parameter in the parent module
+                    parent_module = model
+                    for attr in parts[:-1]:
+                        parent_module = getattr(parent_module, attr)
+                    setattr(parent_module, parts[-1], new_param)
+    
                 else:
-                    missing_keys.append(name)
-
+                    # If not meta, just copy the data
+                    if tensor.dtype != param.dtype:
+                        tensor = tensor.to(param.dtype)
+                    tensor = tensor.to(device)
+                    with torch.no_grad():
+                        param.copy_(tensor)
+    
+                # Memory cleanup if memory efficient
+                if self.memory_efficient:
+                    del tensor
+                    torch.cuda.empty_cache()
+    
             except Exception as e:
                 print(f"Error loading weight {name}: {e}")
                 continue
-
+    
+        # Check if any parameter in the model was not matched by the weights
+        model_state_dict = model.state_dict()
+        model_keys = set(model_state_dict.keys())
+        weight_keys = set(processed_weights.keys())
+        missing = model_keys - weight_keys
+        if missing:
+            missing_keys.extend(list(missing))
+        
         if unexpected_keys:
             print(f"Unexpected keys: {unexpected_keys}")
         if missing_keys:
@@ -440,61 +473,61 @@ class ShardedFP8ModelLoader:
     def load_model(self, checkpoint_path: str) -> nn.Module:
         """
         Load and initialize the model with proper error handling.
-        
-        Args:
-            checkpoint_path: Path to model checkpoint
-            
-        Returns:
-            Loaded model
         """
         try:
             # Load config and create model
             config = AutoConfig.from_pretrained(self.model_dir)
             model = AutoModelForCausalLM.from_config(config)
             model = model.cpu()
-
+    
             if self.memory_efficient:
+                # Convert parameters to meta tensors
                 self._convert_to_meta(model)
-
+    
             # Load and process weights
             weights = load_file(checkpoint_path)
-            
-            # Handle key prefix matching
+    
+            # Optional: Filter out unwanted scale keys if they're not used
+            # For example, keys ending with "input_scale" or "weight_scale"
+            weights = {k: v for k, v in weights.items() 
+                       if not (k.endswith('input_scale') or k.endswith('weight_scale'))}
+    
+            # Handle key prefix adjustments if needed
             processed_weights = {}
             for key, value in weights.items():
                 if not key.startswith('model.'):
                     key = f'model.{key}'
                 processed_weights[key] = value
-            
+    
             # Create shard mapping
             shard_mapping = self._create_shard_mapping(processed_weights)
-            
+    
             # Load on CPU first
             load_device = torch.device('cpu')
             self.async_loader.start_prefetch(shard_mapping, self.fp8_handler, load_device)
-
+    
             while True:
                 shard = self.async_loader.get_next_shard()
                 if shard is None:
                     break
-                    
+    
                 shard_id, shard_weights = shard
                 self._load_shard_weights(model, shard_weights, device=load_device)
                 self.async_loader.advance()
-                
+    
                 if self.memory_efficient:
                     torch.cuda.empty_cache()
                     gc.collect()
-
-            # Move to GPU
+    
+            # Ensure no meta tensors remain and move to GPU
             self._ensure_no_meta_left(model, load_device)
             model = self._distribute_model_across_gpus(model)
-
+    
             if self.use_ddp and len(self.device_ids) > 1:
                 model = DDP(model, device_ids=[self.device_ids[0]])
-
+    
             return model
-
+    
         except Exception as e:
             print(f"Error loading model: {e}")
             raise
