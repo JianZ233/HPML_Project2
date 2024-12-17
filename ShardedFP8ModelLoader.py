@@ -24,75 +24,131 @@ class FP8Format:
 
 class ByteVerification:
     def __init__(self):
-        # CUDA kernel for byte-level comparison
+        print("Initializing ByteVerification...")
         self.compare_kernel = cp.RawKernel(r'''
         extern "C" __global__
-        void compare_bytes(const unsigned char* arr1, const unsigned char* arr2, 
+        void compare_bytes(const float* arr1, const float* arr2, 
                          int n, int* diff_count, int* first_diff_idx) {
             int tid = blockDim.x * blockIdx.x + threadIdx.x;
             
             if (tid < n) {
+                // Compare actual float values instead of bytes
                 if (arr1[tid] != arr2[tid]) {
                     atomicAdd(diff_count, 1);
-                    // Store first difference index if not already set
                     atomicCAS(first_diff_idx, -1, tid);
                 }
             }
         }
         ''', 'compare_bytes')
+        print("CUDA kernel compiled successfully")
 
     def verify_tensors(self, tensor1: torch.Tensor, tensor2: torch.Tensor) -> Tuple[bool, int, int]:
-        """
-        Verify two tensors byte by byte using CuPy kernel.
+        print("\n=== Starting Tensor Verification ===")
+        print(f"Tensor 1 shape: {tensor1.shape}, dtype: {tensor1.dtype}")
+        print(f"Tensor 2 shape: {tensor2.shape}, dtype: {tensor2.dtype}")
         
-        Args:
-            tensor1: First tensor
-            tensor2: Second tensor
+        # Convert both tensors to float32 on CPU first
+        tensor1 = tensor1.detach().cpu().float()
+        tensor2 = tensor2.detach().cpu().float()
+        print("Converted tensors to FP32 on CPU")
+        
+        # Move to GPU and ensure contiguous memory layout
+        tensor1 = tensor1.cuda().contiguous()
+        tensor2 = tensor2.cuda().contiguous()
+        print("Moved tensors to GPU")
+        
+        num_elements = tensor1.numel()
+        print(f"Comparing {num_elements} elements")
+        
+        if tensor1.shape != tensor2.shape:
+            print(f"WARNING: Shape mismatch! {tensor1.shape} vs {tensor2.shape}")
+            return False, abs(tensor1.numel() - tensor2.numel()), 0
+        
+        try:
+            # Create float arrays from tensor data
+            arr1 = cp.asarray(tensor1.view(-1))
+            arr2 = cp.asarray(tensor2.view(-1))
+            print("Successfully created arrays")
             
-        Returns:
-            Tuple of (is_identical: bool, number_of_differences: int, first_difference_index: int)
-        """
-        # Ensure tensors are on GPU
-        if not tensor1.is_cuda:
-            tensor1 = tensor1.cuda()
-        if not tensor2.is_cuda:
-            tensor2 = tensor2.cuda()
+            # Initialize difference counter and first difference index
+            diff_count = cp.zeros(1, dtype=cp.int32)
+            first_diff_idx = cp.full(1, -1, dtype=cp.int32)
+            
+            # Configure kernel grid
+            threads_per_block = 256
+            blocks = (num_elements + threads_per_block - 1) // threads_per_block
+            print(f"Launching kernel with {blocks} blocks, {threads_per_block} threads per block")
+            
+            # Launch kernel
+            self.compare_kernel(
+                grid=(blocks,),
+                block=(threads_per_block,),
+                args=(arr1, arr2, num_elements, diff_count, first_diff_idx)
+            )
+            
+            # Get results
+            num_differences = int(diff_count.get())
+            first_diff = int(first_diff_idx.get())
+            print(f"Verification complete. Found {num_differences} differences")
+            
+            if first_diff >= 0:
+                print(f"First difference at element {first_diff}")
+                print(f"Values at first difference: {float(arr1[first_diff])} vs {float(arr2[first_diff])}")
+            
+            return num_differences == 0, num_differences, first_diff
+            
+        except Exception as e:
+            print(f"ERROR during verification: {e}")
+            raise
         
-        # Get tensor byte size
-        nbytes1 = tensor1.nelement() * tensor1.element_size()
-        nbytes2 = tensor2.nelement() * tensor2.element_size()
+def _verify_fp8_weights(self, original: torch.Tensor, processed: torch.Tensor, name: str) -> bool:
+    print(f"\n=== Verifying weights for {name} ===")
+    try:
+        # Do all operations in FP32 on CPU
+        if isinstance(original, dict):
+            weight = original['weight'].cpu().to(torch.float32)
+            scale = original.get('scale', torch.tensor([1.0])).cpu().to(torch.float32)
+            original_tensor = weight * scale
+        else:
+            original_tensor = original.cpu().to(torch.float32)
         
-        if nbytes1 != nbytes2:
-            return False, abs(nbytes1 - nbytes2), 0
+        processed_tensor = processed.cpu().to(torch.float32)
         
-        # Reinterpret tensors as uint8 arrays
-        bytes1 = cp.asarray(tensor1.data_ptr(), dtype=cp.uint8)
-        bytes2 = cp.asarray(tensor2.data_ptr(), dtype=cp.uint8)
-        
-        # Reshape to match actual byte size
-        bytes1 = bytes1[:nbytes1]
-        bytes2 = bytes2[:nbytes2]
-        
-        # Initialize difference counter and first difference index
-        diff_count = cp.zeros(1, dtype=cp.int32)
-        first_diff_idx = cp.full(1, -1, dtype=cp.int32)
-        
-        # Configure kernel grid
-        threads_per_block = 256
-        blocks = (nbytes1 + threads_per_block - 1) // threads_per_block
-        
-        # Launch kernel
-        self.compare_kernel(
-            grid=(blocks,),
-            block=(threads_per_block,),
-            args=(bytes1, bytes2, nbytes1, diff_count, first_diff_idx)
+        # Call verify_tensors (which will handle GPU movement)
+        is_identical, num_diff, first_diff_idx = self.verifier.verify_tensors(
+            original_tensor, processed_tensor
         )
         
-        # Get results
-        num_differences = int(diff_count.get())
-        first_diff = int(first_diff_idx.get())
+        if not is_identical:
+            print(f"\nWARNING: Verification failed for {name}")
+            print(f"Total different bytes: {num_diff}")
+            print(f"First difference at byte index: {first_diff_idx}")
+            
+            if first_diff_idx >= 0:
+                orig_bytes = cp.asarray(original_tensor.data_ptr(), 
+                                     dtype=cp.uint8)[:first_diff_idx + 1]
+                proc_bytes = cp.asarray(processed_tensor.data_ptr(), 
+                                     dtype=cp.uint8)[:first_diff_idx + 1]
+                print(f"Original byte at difference: {orig_bytes[-1]}")
+                print(f"Processed byte at difference: {proc_bytes[-1]}")
+                
+                # Print surrounding bytes for context
+                start_idx = max(0, first_diff_idx - 4)
+                end_idx = min(len(orig_bytes), first_diff_idx + 5)
+                print("\nBytes around difference point:")
+                print(f"Original: {orig_bytes[start_idx:end_idx].tolist()}")
+                print(f"Processed: {proc_bytes[start_idx:end_idx].tolist()}")
+            return False
         
-        return num_differences == 0, num_differences, first_diff
+        print("Verification passed successfully!")
+        return True
+            
+    except Exception as e:
+        print(f"ERROR during weight verification of {name}: {e}")
+        print("Stack trace:")
+        import traceback
+        traceback.print_exc()
+        return False
 
 
 class GPUMemoryTracker:
@@ -180,54 +236,100 @@ class FP8QuantizationHandler:
 
     def process_weights(self, weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Process weights with proper FP8 handling."""
+        print("\n========= Starting process_weights =========")
         processed = {}
+
+        # Determine target FP8 dtype upfront
+        if self.fp8_format.e4m3 and hasattr(torch, 'float8_e4m3fn'):
+            target_dtype = torch.float8_e4m3fn
+            print("Using e4m3 format")
+        elif not self.fp8_format.e4m3 and hasattr(torch, 'float8_e5m2'):
+            target_dtype = torch.float8_e5m2
+            print("Using e5m2 format")
+        else:
+            target_dtype = torch.float16  # Fallback if FP8 is not supported
+            print("FP8 not supported; falling back to FP16")
         
         for name, tensor in weights.items():
-            # Store original tensor for verification
-            original_tensor = tensor.clone() if isinstance(tensor, torch.Tensor) else {
-                'weight': tensor['weight'].clone(),
-                'scale': tensor['scale'].clone()
-            } if isinstance(tensor, dict) else None
-            
-            # Handle different weight formats
-            if isinstance(tensor, dict):
-                weight = tensor.get('weight', tensor.get('quantized', None))
-                scale = tensor.get('scale', self.fp8_format.scale)
-                if weight is not None:
-                    tensor = weight * scale
-                else:
-                    continue
-            
-            # Determine target FP8 dtype
-            target_dtype = None
-            if self.fp8_format.e4m3 and hasattr(torch, 'float8_e4m3fn'):
-                target_dtype = torch.float8_e4m3fn
-            elif not self.fp8_format.e4m3 and hasattr(torch, 'float8_e5m2'):
-                target_dtype = torch.float8_e5m2
+            print(f"\nProcessing weight: {name}")
             
             try:
-                # Handle tensor conversion
-                if target_dtype:
-                    if tensor.dtype != target_dtype:
-                        tensor = tensor.to(torch.float32)
-                        tensor = self._apply_fp8_constraints(tensor)
-                        tensor = tensor.to(target_dtype)
-                else:
-                    tensor = tensor.to(torch.float16)
-            
-                # Optimize memory format
-                tensor = self.optimize_memory_format(tensor)
+                # Print original tensor info
+                print(f"Original tensor type: {type(tensor)}")
+                if isinstance(tensor, dict):
+                    print(f"Dict keys: {tensor.keys()}")
+                elif isinstance(tensor, torch.Tensor):
+                    print(f"Tensor shape: {tensor.shape}, dtype: {tensor.dtype}")
                 
-                # Verify the processed tensor against original
-                if original_tensor is not None:
-                    self._verify_fp8_weights(original_tensor, tensor, name)
+                # Store original tensor for verification with default scale
+                original_tensor = tensor.clone() if isinstance(tensor, torch.Tensor) else {
+                    'weight': tensor['weight'].clone(),
+                    'scale': tensor.get('scale', torch.tensor([1.0], dtype=torch.float32))
+                } if isinstance(tensor, dict) else None
                 
-                processed[name] = tensor
+                print(f"Created original_tensor: {type(original_tensor)}")
                 
+                # Handle different weight formats
+                if isinstance(tensor, dict):
+                    print("Processing dict format tensor")
+                    weight = tensor.get('weight', tensor.get('quantized', None))
+                    scale = tensor.get('scale', torch.tensor([1.0], dtype=torch.float32))  # Default scale
+                    if weight is not None:
+                        # Move to CPU and convert to FP32
+                        weight_cpu = weight.cpu().to(torch.float32)
+                        scale_cpu = scale.cpu().to(torch.float32)
+                        
+                        # Do multiplication in FP32 on CPU
+                        tensor = weight_cpu * scale_cpu
+                        
+                        # Convert back to original dtype
+                        if target_dtype:
+                            tensor = tensor.to(target_dtype)
+                            print(f"Converted to {target_dtype}")
+                    else:
+                        print("No weight found in dict, skipping")
+                        continue
+                                
+                try:
+                    # Handle tensor conversion
+                    print(f"Converting tensor from {tensor.dtype} to target dtype")
+                    if target_dtype:
+                        if tensor.dtype != target_dtype:
+                            tensor = tensor.cpu().to(torch.float32)  # Move to CPU for FP32
+                            print("Applied FP32 conversion")
+                            tensor = self._apply_fp8_constraints(tensor)
+                            print("Applied FP8 constraints")
+                            tensor = tensor.to(target_dtype)
+                            print(f"Converted to {target_dtype}")
+                    else:
+                        tensor = tensor.to(torch.float16)
+                        print("Converted to FP16 (no FP8 dtype available)")
+                
+                    # Optimize memory format
+                    print("Optimizing memory format")
+                    tensor = self.optimize_memory_format(tensor)
+                    print(f"Final tensor shape: {tensor.shape}, dtype: {tensor.dtype}")
+                    
+                    # Verify the processed tensor against original
+                    if original_tensor is not None:
+                        print("\nStarting verification")
+                        verified = self._verify_fp8_weights(original_tensor, tensor, name)
+                        print(f"Verification {'passed' if verified else 'failed'}")
+                    else:
+                        print("Skipping verification - no original tensor")
+                    
+                    processed[name] = tensor
+                    
+                except Exception as e:
+                    print(f"Error during tensor conversion: {e}")
+                    processed[name] = tensor.to(torch.float16)
+                    
             except Exception as e:
-                print(f"Warning: Error processing weight {name}: {e}")
-                processed[name] = tensor.to(torch.float16)
-        
+                print(f"Error processing weight {name}: {e}")
+                if isinstance(tensor, torch.Tensor):
+                    processed[name] = tensor.to(torch.float16)
+                    
+        print("\n========= Completed process_weights =========")
         return processed
 
     def _apply_fp8_constraints(self, tensor: torch.Tensor) -> torch.Tensor:
@@ -276,7 +378,7 @@ class FP8QuantizationHandler:
         try:
             if isinstance(original, dict):
                 # Compute original * scale on GPU
-                weight = original['weight'].cuda()
+                weight = original['weight'].cuda() 
                 scale = original['scale'].cuda()
                 original_tensor = weight * scale
             else:
@@ -501,7 +603,7 @@ class ShardedFP8ModelLoader:
         
         Args:
             weights: Dictionary of weights
-            
+        
         Returns:
             Processed weights
         """
@@ -510,15 +612,26 @@ class ShardedFP8ModelLoader:
             try:
                 if isinstance(tensor, dict):
                     # Handle FP8 weight with scales
-                    if all(k in tensor for k in ['weight', 'scale']):
-                        weight = tensor['weight']
-                        scale = tensor['scale']
-                        processed[name] = weight * scale
+                    weight = tensor.get("weight", None)
+                    scale = tensor.get("scale", None)
+
+                    if weight is None:
+                        # Skip if no "weight" is found
+                        print(f"Skipping {name}: No weight tensor found in dict.")
+                        continue
+
+                    if scale is None:
+                        # Process weights without scale
+                        print(f"Warning: No scale found for {name}. Proceeding without scaling.")
+                        processed[name] = weight
                     else:
-                        processed[name] = tensor.get('weight', tensor)
+                        # Properly scale the weights
+                        processed[name] = weight * scale
                 else:
+                    # If tensor is not a dictionary, just pass it through
                     processed[name] = tensor
             except Exception as e:
+                # Log any errors and proceed
                 print(f"Warning: Error processing weight {name}: {e}")
                 processed[name] = tensor
         return processed
