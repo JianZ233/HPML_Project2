@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import cupy as cp
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 from typing import List, Optional, Dict, Any, Tuple, Union
@@ -20,6 +21,79 @@ class FP8Format:
     scale: float = 1.0
     bias: int = 7  # 7 for e4m3, 15 for e5m2
     max_value: float = 448.0  # 448.0 for e4m3, 57344.0 for e5m2
+
+class ByteVerification:
+    def __init__(self):
+        # CUDA kernel for byte-level comparison
+        self.compare_kernel = cp.RawKernel(r'''
+        extern "C" __global__
+        void compare_bytes(const unsigned char* arr1, const unsigned char* arr2, 
+                         int n, int* diff_count, int* first_diff_idx) {
+            int tid = blockDim.x * blockIdx.x + threadIdx.x;
+            
+            if (tid < n) {
+                if (arr1[tid] != arr2[tid]) {
+                    atomicAdd(diff_count, 1);
+                    // Store first difference index if not already set
+                    atomicCAS(first_diff_idx, -1, tid);
+                }
+            }
+        }
+        ''', 'compare_bytes')
+
+    def verify_tensors(self, tensor1: torch.Tensor, tensor2: torch.Tensor) -> Tuple[bool, int, int]:
+        """
+        Verify two tensors byte by byte using CuPy kernel.
+        
+        Args:
+            tensor1: First tensor
+            tensor2: Second tensor
+            
+        Returns:
+            Tuple of (is_identical: bool, number_of_differences: int, first_difference_index: int)
+        """
+        # Ensure tensors are on GPU
+        if not tensor1.is_cuda:
+            tensor1 = tensor1.cuda()
+        if not tensor2.is_cuda:
+            tensor2 = tensor2.cuda()
+        
+        # Get tensor byte size
+        nbytes1 = tensor1.nelement() * tensor1.element_size()
+        nbytes2 = tensor2.nelement() * tensor2.element_size()
+        
+        if nbytes1 != nbytes2:
+            return False, abs(nbytes1 - nbytes2), 0
+        
+        # Reinterpret tensors as uint8 arrays
+        bytes1 = cp.asarray(tensor1.data_ptr(), dtype=cp.uint8)
+        bytes2 = cp.asarray(tensor2.data_ptr(), dtype=cp.uint8)
+        
+        # Reshape to match actual byte size
+        bytes1 = bytes1[:nbytes1]
+        bytes2 = bytes2[:nbytes2]
+        
+        # Initialize difference counter and first difference index
+        diff_count = cp.zeros(1, dtype=cp.int32)
+        first_diff_idx = cp.full(1, -1, dtype=cp.int32)
+        
+        # Configure kernel grid
+        threads_per_block = 256
+        blocks = (nbytes1 + threads_per_block - 1) // threads_per_block
+        
+        # Launch kernel
+        self.compare_kernel(
+            grid=(blocks,),
+            block=(threads_per_block,),
+            args=(bytes1, bytes2, nbytes1, diff_count, first_diff_idx)
+        )
+        
+        # Get results
+        num_differences = int(diff_count.get())
+        first_diff = int(first_diff_idx.get())
+        
+        return num_differences == 0, num_differences, first_diff
+
 
 class GPUMemoryTracker:
     """Tracks GPU memory usage and allocation."""
@@ -102,12 +176,19 @@ class FP8QuantizationHandler:
     
     def __init__(self, fp8_format: Optional[FP8Format] = None):
         self.fp8_format = fp8_format or FP8Format()
+        self.verifier = ByteVerification()
 
     def process_weights(self, weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Process weights with proper FP8 handling."""
         processed = {}
         
         for name, tensor in weights.items():
+            # Store original tensor for verification
+            original_tensor = tensor.clone() if isinstance(tensor, torch.Tensor) else {
+                'weight': tensor['weight'].clone(),
+                'scale': tensor['scale'].clone()
+            } if isinstance(tensor, dict) else None
+            
             # Handle different weight formats
             if isinstance(tensor, dict):
                 weight = tensor.get('weight', tensor.get('quantized', None))
@@ -133,6 +214,13 @@ class FP8QuantizationHandler:
                         tensor = tensor.to(target_dtype)
                 else:
                     tensor = tensor.to(torch.float16)
+            
+                # Optimize memory format
+                tensor = self.optimize_memory_format(tensor)
+                
+                # Verify the processed tensor against original
+                if original_tensor is not None:
+                    self._verify_fp8_weights(original_tensor, tensor, name)
                 
                 processed[name] = tensor
                 
@@ -171,6 +259,58 @@ class FP8QuantizationHandler:
             tensor = torch.nn.functional.pad(tensor, (0, pad_size))
             
         return tensor
+    
+    def _verify_fp8_weights(self, original: torch.Tensor, processed: torch.Tensor, 
+                       name: str) -> bool:
+        """
+        Verify FP8 weights using byte-level comparison.
+        
+        Args:
+            original: Original tensor or dict with weight and scale
+            processed: Processed tensor
+            name: Name of weight for logging
+            
+        Returns:
+            bool: True if verification passes
+        """
+        try:
+            if isinstance(original, dict):
+                # Compute original * scale on GPU
+                weight = original['weight'].cuda()
+                scale = original['scale'].cuda()
+                original_tensor = weight * scale
+            else:
+                original_tensor = original.cuda()
+            
+            # Ensure processed tensor is on GPU
+            processed_tensor = processed.cuda()
+            
+            # Verify tensors
+            is_identical, num_diff, first_diff_idx = self.verifier.verify_tensors(
+                original_tensor, processed_tensor
+            )
+            
+            if not is_identical:
+                print(f"Warning: Byte verification failed for {name}")
+                print(f"Number of different bytes: {num_diff}")
+                print(f"First difference at byte index: {first_diff_idx}")
+                
+                # Get actual values at first difference if available
+                if first_diff_idx >= 0:
+                    orig_bytes = cp.asarray(original_tensor.storage().data_ptr(), 
+                                        dtype=cp.uint8)[:first_diff_idx + 1]
+                    proc_bytes = cp.asarray(processed_tensor.storage().data_ptr(), 
+                                        dtype=cp.uint8)[:first_diff_idx + 1]
+                    print(f"Original byte at difference: {orig_bytes[-1]}")
+                    print(f"Processed byte at difference: {proc_bytes[-1]}")
+                
+                return False
+                
+            return True
+            
+        except Exception as e:
+            print(f"Error during byte verification of {name}: {e}")
+            return False
 
 class ShardedFP8ModelLoader:
     """Main loader class for handling sharded FP8 models."""
