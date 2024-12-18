@@ -25,9 +25,8 @@ class FP8Format:
 class ByteVerification:
     def __init__(self):
         print("Initializing ByteVerification...")
-        # Much more lenient tolerance - allow differences up to 0.5
-        self.abs_tol = 0.5
-        self.chunk_size = 1_000_000  # Process 1M elements at a time
+        self.abs_tol = 0.001  # Fixed absolute tolerance of 0.001
+        self.chunk_size = 1_000_000
         
         self.compare_kernel = cp.RawKernel(r'''
         extern "C" __global__
@@ -41,12 +40,6 @@ class ByteVerification:
                 float val2 = arr2[tid];
                 float abs_diff = abs(val1 - val2);
                 
-                // For very small values, consider them equal
-                if (abs(val1) < 1e-6 && abs(val2) < 1e-6) {
-                    return;
-                }
-                
-                // Only count large differences
                 if (abs_diff > abs_tol) {
                     atomicAdd(diff_count, 1);
                     atomicCAS(first_diff_idx, -1, tid);
@@ -54,12 +47,9 @@ class ByteVerification:
             }
         }
         ''', 'compare_bytes')
-        print("CUDA kernel compiled successfully")
 
     def verify_tensors(self, tensor1: torch.Tensor, tensor2: torch.Tensor) -> Tuple[bool, int, int]:
         print("\n=== Starting Tensor Verification ===")
-        print(f"Tensor 1 shape: {tensor1.shape}, dtype: {tensor1.dtype}")
-        print(f"Tensor 2 shape: {tensor2.shape}, dtype: {tensor2.dtype}")
         print(f"Using absolute tolerance: {self.abs_tol}")
         
         try:
@@ -72,20 +62,18 @@ class ByteVerification:
             # Convert both tensors to float32 and detach
             tensor1 = tensor1.detach().to(torch.float32)
             tensor2 = tensor2.detach().to(torch.float32)
-            print("Converted tensors to FP32")
             
             # Move to CPU
             tensor1 = tensor1.cpu()
             tensor2 = tensor2.cpu()
             
             num_elements = tensor1.numel()
-            print(f"Comparing {num_elements} elements in chunks of {self.chunk_size}")
             
             if tensor1.shape != tensor2.shape:
                 print(f"WARNING: Shape mismatch! {tensor1.shape} vs {tensor2.shape}")
                 return False, abs(tensor1.numel() - tensor2.numel()), 0
             
-            # Initialize total difference counter and first difference tracking
+            # Initialize counters
             total_differences = 0
             first_diff_element = -1
             first_diff_val1 = None
@@ -95,7 +83,6 @@ class ByteVerification:
             for start_idx in range(0, num_elements, self.chunk_size):
                 end_idx = min(start_idx + self.chunk_size, num_elements)
                 chunk_size = end_idx - start_idx
-                print(f"\nProcessing chunk {start_idx//self.chunk_size + 1}/{(num_elements+self.chunk_size-1)//self.chunk_size}")
                 
                 # Move chunk to GPU
                 chunk1 = tensor1.view(-1)[start_idx:end_idx].cuda().contiguous()
@@ -105,7 +92,8 @@ class ByteVerification:
                 arr1 = cp.asarray(chunk1)
                 arr2 = cp.asarray(chunk2)
                 
-                # Initialize difference counter and first difference index for this chunk
+                # Create GPU parameters
+                abs_tol = cp.float32(self.abs_tol)
                 diff_count = cp.zeros(1, dtype=cp.int32)
                 first_diff_idx = cp.full(1, -1, dtype=cp.int32)
                 
@@ -117,7 +105,7 @@ class ByteVerification:
                 self.compare_kernel(
                     grid=(blocks,),
                     block=(threads_per_block,),
-                    args=(arr1, arr2, chunk_size, self.abs_tol, 
+                    args=(arr1, arr2, chunk_size, abs_tol,
                          diff_count, first_diff_idx)
                 )
                 
@@ -135,24 +123,23 @@ class ByteVerification:
                     first_diff_val2 = float(arr2[chunk_first_diff])
                 
                 # Clean up GPU memory
-                del chunk1, chunk2, arr1, arr2
+                del chunk1, chunk2, arr1, arr2, abs_tol
                 torch.cuda.empty_cache()
-            
-            print(f"\nVerification complete. Found {total_differences} differences")
             
             if first_diff_element >= 0:
                 print(f"First difference at element {first_diff_element}")
-                print(f"Values at first difference: {first_diff_val1} vs {first_diff_val2}")
-                print(f"Absolute difference: {abs(first_diff_val1 - first_diff_val2)}")
+                print(f"Values at difference: {first_diff_val1} vs {first_diff_val2}")
+                abs_diff = abs(first_diff_val1 - first_diff_val2)
+                print(f"Absolute difference: {abs_diff}")
             
-            # Allow up to 99.9% of values to differ within tolerance
+            # Calculate percentage that exceed tolerance
             diff_percentage = (total_differences / num_elements) * 100
             is_successful = diff_percentage <= 99.9
             
             if is_successful:
-                print(f"Verification passed: {diff_percentage:.2f}% values differ")
+                print(f"Verification passed: {diff_percentage:.4f}% values exceed tolerance")
             else:
-                print(f"Verification failed: {diff_percentage:.2f}% values differ")
+                print(f"Verification failed: {diff_percentage:.4f}% values exceed tolerance")
             
             return is_successful, total_differences, first_diff_element
             
