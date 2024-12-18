@@ -13,6 +13,7 @@ from safetensors.torch import load_file
 from enum import Enum
 from transformers import AutoConfig, AutoModelForCausalLM
 import gc
+import matplotlib as plt
 
 @dataclass
 class FP8Format:
@@ -25,7 +26,7 @@ class FP8Format:
 class ByteVerification:
     def __init__(self):
         print("Initializing ByteVerification...")
-        self.abs_tol = 0.001  # Fixed absolute tolerance of 0.001
+        self.abs_tol = 0.001  
         self.chunk_size = 1_000_000
         
         self.compare_kernel = cp.RawKernel(r'''
@@ -147,6 +148,50 @@ class ByteVerification:
             print(f"ERROR during verification: {e}")
             raise
 
+class LayerVerificationPlotter:
+    def __init__(self):
+        import matplotlib.pyplot as plt
+        self.plt = plt
+        self.results = {}
+    
+    def add_result(self, layer_name: str, num_diffs: int, total_elements: int):
+        """Add verification result for a layer."""
+        diff_percentage = (num_diffs / total_elements) * 100
+        self.results[layer_name] = diff_percentage
+    
+    def plot(self, title: str = "FP8 Verification Results", figsize=(15, 8)):
+        """Create and show the plot."""
+        # Sort layers by name to ensure consistent ordering
+        layers = sorted(self.results.keys())
+        percentages = [self.results[layer] for layer in layers]
+        
+        # Create figure
+        fig, ax = self.plt.subplots(figsize=figsize)
+        
+        # Create bars
+        bars = ax.bar(range(len(layers)), percentages)
+        
+        # Customize plot
+        ax.set_xticks(range(len(layers)))
+        ax.set_xticklabels(layers, rotation=45, ha='right')
+        ax.set_ylabel('Percentage of Values Exceeding Tolerance (0.001)')
+        ax.set_title(title)
+        
+        # Set y-axis limits with some padding
+        max_percentage = max(percentages)
+        ax.set_ylim([0, max_percentage * 1.1])  # Add 10% padding at the top
+        
+        # Add value labels on top of bars
+        for bar in bars:
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2., height,
+                   f'{height:.2f}%',
+                   ha='center', va='bottom')
+        
+        # Adjust layout to prevent label cutoff
+        self.plt.tight_layout()
+        
+        return fig
 
 class GPUMemoryTracker:
     """Tracks GPU memory usage and allocation."""
@@ -234,6 +279,7 @@ class FP8QuantizationHandler:
     def process_weights(self, weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Process weights with proper FP8 handling."""
         print("\n========= Starting process_weights =========")
+        plotter = LayerVerificationPlotter()  # Create plotter instance
         processed = {}
 
         # Determine target FP8 dtype upfront
@@ -248,72 +294,47 @@ class FP8QuantizationHandler:
             print("FP8 not supported; falling back to FP16")
         
         for name, tensor in weights.items():
-            print(f"\nProcessing weight: {name}")
-            
             try:
-                # Print original tensor info
-                print(f"Original tensor type: {type(tensor)}")
-                if isinstance(tensor, dict):
-                    print(f"Dict keys: {tensor.keys()}")
-                elif isinstance(tensor, torch.Tensor):
-                    print(f"Tensor shape: {tensor.shape}, dtype: {tensor.dtype}")
-                
                 # Store original tensor for verification with default scale
                 original_tensor = tensor.clone() if isinstance(tensor, torch.Tensor) else {
                     'weight': tensor['weight'].clone(),
                     'scale': tensor.get('scale', torch.tensor([1.0], dtype=torch.float32))
                 } if isinstance(tensor, dict) else None
                 
-                print(f"Created original_tensor: {type(original_tensor)}")
-                
                 # Handle different weight formats
                 if isinstance(tensor, dict):
-                    print("Processing dict format tensor")
                     weight = tensor.get('weight', tensor.get('quantized', None))
-                    scale = tensor.get('scale', torch.tensor([1.0], dtype=torch.float32))  # Default scale
+                    scale = tensor.get('scale', torch.tensor([1.0], dtype=torch.float32))
                     if weight is not None:
-                        # Move to CPU and convert to FP32
                         weight_cpu = weight.cpu().to(torch.float32)
                         scale_cpu = scale.cpu().to(torch.float32)
-                        
-                        # Do multiplication in FP32 on CPU
                         tensor = weight_cpu * scale_cpu
-                        
-                        # Convert back to original dtype
                         if target_dtype:
                             tensor = tensor.to(target_dtype)
-                            print(f"Converted to {target_dtype}")
                     else:
-                        print("No weight found in dict, skipping")
                         continue
                                 
                 try:
                     # Handle tensor conversion
-                    print(f"Converting tensor from {tensor.dtype} to target dtype")
                     if target_dtype:
                         if tensor.dtype != target_dtype:
-                            tensor = tensor.cpu().to(torch.float32)  # Move to CPU for FP32
-                            print("Applied FP32 conversion")
+                            tensor = tensor.cpu().to(torch.float32)
                             tensor = self._apply_fp8_constraints(tensor)
-                            print("Applied FP8 constraints")
                             tensor = tensor.to(target_dtype)
-                            print(f"Converted to {target_dtype}")
                     else:
                         tensor = tensor.to(torch.float16)
-                        print("Converted to FP16 (no FP8 dtype available)")
                 
                     # Optimize memory format
-                    print("Optimizing memory format")
                     tensor = self.optimize_memory_format(tensor)
-                    print(f"Final tensor shape: {tensor.shape}, dtype: {tensor.dtype}")
                     
-                    # Verify the processed tensor against original
+                    # Verify and collect results for plotting
                     if original_tensor is not None:
-                        print("\nStarting verification")
                         verified = self._verify_fp8_weights(original_tensor, tensor, name)
-                        print(f"Verification {'passed' if verified else 'failed'}")
-                    else:
-                        print("Skipping verification - no original tensor")
+                        # Add data point to plot
+                        num_elements = (original_tensor['weight'].numel() 
+                                     if isinstance(original_tensor, dict) 
+                                     else original_tensor.numel())
+                        plotter.add_result(name, num_elements - num_elements * int(verified), num_elements)
                     
                     processed[name] = tensor
                     
@@ -325,6 +346,11 @@ class FP8QuantizationHandler:
                 print(f"Error processing weight {name}: {e}")
                 if isinstance(tensor, torch.Tensor):
                     processed[name] = tensor.to(torch.float16)
+        
+        # Create and save the plot
+        fig = plotter.plot(title="FP8 Conversion Verification Results")
+        fig.savefig('fp8_verification_results.png', bbox_inches='tight', dpi=300)
+        plt.close(fig)
                     
         print("\n========= Completed process_weights =========")
         return processed
