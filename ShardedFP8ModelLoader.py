@@ -13,7 +13,8 @@ from safetensors.torch import load_file
 from enum import Enum
 from transformers import AutoConfig, AutoModelForCausalLM
 import gc
-import matplotlib as plt
+import matplotlib.pyplot as plt
+import seaborn as sns 
 
 @dataclass
 class FP8Format:
@@ -148,25 +149,34 @@ class ByteVerification:
             print(f"ERROR during verification: {e}")
             raise
 
-class LayerVerificationPlotter:
+class ExtendedVerificationPlotter:
     def __init__(self):
-        import matplotlib.pyplot as plt
-        self.plt = plt
-        self.results = {}
-    
-    def add_result(self, layer_name: str, num_diffs: int, total_elements: int):
-        """Add verification result for a layer."""
-        diff_percentage = (num_diffs / total_elements) * 100
-        self.results[layer_name] = diff_percentage
-    
-    def plot(self, title: str = "FP8 Verification Results", figsize=(15, 8)):
-        """Create and show the plot."""
-        # Sort layers by name to ensure consistent ordering
-        layers = sorted(self.results.keys())
-        percentages = [self.results[layer] for layer in layers]
+        self.layer_results = {}  # Store basic percentage differences
+        self.detailed_results = {}  # Store more detailed metrics
         
-        # Create figure
-        fig, ax = self.plt.subplots(figsize=figsize)
+    def add_result(self, layer_name: str, num_diffs: int, total_elements: int, 
+                  first_diff_val1: float = None, first_diff_val2: float = None,
+                  abs_diff: float = None):
+        """Add verification result with detailed metrics for a layer."""
+        diff_percentage = (num_diffs / total_elements) * 100
+        self.layer_results[layer_name] = diff_percentage
+        
+        self.detailed_results[layer_name] = {
+            'num_diffs': num_diffs,
+            'total_elements': total_elements,
+            'diff_percentage': diff_percentage,
+            'first_diff_val1': first_diff_val1,
+            'first_diff_val2': first_diff_val2,
+            'abs_diff': abs_diff
+        }
+
+    def plot(self, title: str = "FP8 Verification Results", figsize=(15, 8)):
+        """Create the original bar plot of difference percentages."""
+        fig, ax = plt.subplots(figsize=figsize)
+        
+        # Sort layers by name for consistent ordering
+        layers = sorted(self.layer_results.keys())
+        percentages = [self.layer_results[layer] for layer in layers]
         
         # Create bars
         bars = ax.bar(range(len(layers)), percentages)
@@ -174,7 +184,7 @@ class LayerVerificationPlotter:
         # Customize plot
         ax.set_xticks(range(len(layers)))
         ax.set_xticklabels(layers, rotation=45, ha='right')
-        ax.set_ylabel('Percentage of Values Exceeding Tolerance (0.001)')
+        ax.set_ylabel('Percentage of Values Exceeding Tolerance')
         ax.set_title(title)
         
         # Set y-axis limits with some padding
@@ -188,9 +198,116 @@ class LayerVerificationPlotter:
                    f'{height:.2f}%',
                    ha='center', va='bottom')
         
-        # Adjust layout to prevent label cutoff
-        self.plt.tight_layout()
+        plt.tight_layout()
+        return fig
+    
+    def plot_heatmap(self, figsize=(12, 8)):
+        """Create a heatmap showing the distribution of differences across layers."""
+        fig, ax = plt.subplots(figsize=figsize)
         
+        # Reshape data for heatmap
+        layer_names = list(self.layer_results.keys())
+        percentages = np.array([self.layer_results[layer] for layer in layer_names])
+        
+        # Create heatmap matrix (1 row, multiple columns)
+        heatmap_data = percentages.reshape(1, -1)
+        
+        # Plot heatmap
+        sns.heatmap(heatmap_data, 
+                   cmap='YlOrRd',
+                   annot=True, 
+                   fmt='.2f',
+                   xticklabels=layer_names,
+                   yticklabels=['Difference %'],
+                   cbar_kws={'label': 'Percentage of Different Values'})
+        
+        plt.title('Distribution of Differences Across Layers')
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout()
+        
+        return fig
+    
+    def plot_difference_distribution(self, figsize=(15, 6)):
+        """Create a violin plot showing the distribution of absolute differences."""
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize)
+        
+        # Prepare data for plotting
+        abs_diffs = [result['abs_diff'] for result in self.detailed_results.values() 
+                    if result['abs_diff'] is not None]
+        
+        if abs_diffs:
+            # Left plot: Violin plot of absolute differences
+            sns.violinplot(data=abs_diffs, ax=ax1)
+            ax1.set_title('Distribution of Absolute Differences')
+            ax1.set_ylabel('Absolute Difference')
+            
+            # Right plot: Log-scale distribution
+            sns.violinplot(data=np.log10(abs_diffs), ax=ax2)
+            ax2.set_title('Log-Scale Distribution of Differences')
+            ax2.set_ylabel('Log10(Absolute Difference)')
+        
+        plt.tight_layout()
+        return fig
+    
+    def plot_layer_comparison(self, figsize=(12, 6)):
+        """Create a comparative visualization of original vs converted values."""
+        fig, ax = plt.subplots(figsize=figsize)
+        
+        # Prepare data
+        layers = []
+        orig_vals = []
+        conv_vals = []
+        
+        for layer, data in self.detailed_results.items():
+            if data['first_diff_val1'] is not None and data['first_diff_val2'] is not None:
+                layers.append(layer)
+                orig_vals.append(data['first_diff_val1'])
+                conv_vals.append(data['first_diff_val2'])
+        
+        if layers:
+            x = np.arange(len(layers))
+            width = 0.35
+            
+            ax.bar(x - width/2, orig_vals, width, label='Original Value')
+            ax.bar(x + width/2, conv_vals, width, label='Converted Value')
+            
+            ax.set_ylabel('Value')
+            ax.set_title('Comparison of First Different Values in Each Layer')
+            ax.set_xticks(x)
+            ax.set_xticklabels(layers, rotation=45, ha='right')
+            ax.legend()
+        
+        plt.tight_layout()
+        return fig
+    
+    def plot_summary_statistics(self, figsize=(10, 6)):
+        """Create a summary statistics visualization."""
+        fig, ax = plt.subplots(figsize=figsize)
+        
+        # Calculate statistics
+        stats = {
+            'Mean Diff %': np.mean(list(self.layer_results.values())),
+            'Median Diff %': np.median(list(self.layer_results.values())),
+            'Max Diff %': np.max(list(self.layer_results.values())),
+            'Min Diff %': np.min(list(self.layer_results.values())),
+            'Std Dev %': np.std(list(self.layer_results.values()))
+        }
+        
+        # Create bar plot
+        bars = ax.bar(stats.keys(), stats.values())
+        
+        # Add value labels on top of bars
+        for bar in bars:
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2., height,
+                   f'{height:.2f}%',
+                   ha='center', va='bottom')
+        
+        ax.set_title('Summary Statistics of Differences')
+        ax.set_ylabel('Percentage')
+        plt.xticks(rotation=45)
+        
+        plt.tight_layout()
         return fig
 
 class GPUMemoryTracker:
@@ -277,9 +394,9 @@ class FP8QuantizationHandler:
         self.verifier = ByteVerification()
 
     def process_weights(self, weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Process weights with proper FP8 handling."""
+        """Process weights with proper FP8 handling and extended visualization."""
         print("\n========= Starting process_weights =========")
-        plotter = LayerVerificationPlotter()  # Create plotter instance
+        plotter = ExtendedVerificationPlotter()  # Create plotter instance
         processed = {}
 
         # Determine target FP8 dtype upfront
@@ -327,14 +444,44 @@ class FP8QuantizationHandler:
                     # Optimize memory format
                     tensor = self.optimize_memory_format(tensor)
                     
-                    # Verify and collect results for plotting
+                    # Verify and collect detailed results
                     if original_tensor is not None:
-                        verified = self._verify_fp8_weights(original_tensor, tensor, name)
-                        # Add data point to plot
+                        # Convert tensors for verification
+                        if isinstance(original_tensor, dict):
+                            orig_weight = original_tensor['weight'].cpu().to(torch.float32)
+                            orig_scale = original_tensor['scale'].cpu().to(torch.float32)
+                            verify_original = orig_weight * orig_scale
+                        else:
+                            verify_original = original_tensor.cpu().to(torch.float32)
+                        
+                        verify_processed = tensor.cpu().to(torch.float32)
+                        
+                        # Get detailed verification results
+                        is_identical, num_diff, first_diff_idx = self.verifier.verify_tensors(
+                            verify_original, verify_processed
+                        )
+                        
+                        # Get values at first difference if there is one
+                        first_val1 = None
+                        first_val2 = None
+                        abs_diff = None
+                        if first_diff_idx >= 0:
+                            first_val1 = float(verify_original.flatten()[first_diff_idx])
+                            first_val2 = float(verify_processed.flatten()[first_diff_idx])
+                            abs_diff = abs(first_val1 - first_val2)
+                        
+                        # Add data point to plotter
                         num_elements = (original_tensor['weight'].numel() 
-                                     if isinstance(original_tensor, dict) 
-                                     else original_tensor.numel())
-                        plotter.add_result(name, num_elements - num_elements * int(verified), num_elements)
+                                    if isinstance(original_tensor, dict) 
+                                    else original_tensor.numel())
+                        plotter.add_result(
+                            name,
+                            num_diff,
+                            num_elements,
+                            first_val1,
+                            first_val2,
+                            abs_diff
+                        )
                     
                     processed[name] = tensor
                     
@@ -347,11 +494,37 @@ class FP8QuantizationHandler:
                 if isinstance(tensor, torch.Tensor):
                     processed[name] = tensor.to(torch.float16)
         
-        # Create and save the plot
-        fig = plotter.plot(title="FP8 Conversion Verification Results")
-        fig.savefig('fp8_verification_results.png', bbox_inches='tight', dpi=300)
-        plt.close(fig)
-                    
+        # Create and save all visualizations
+        try:
+            # Original percentage plot
+            fig_percent = plotter.plot("FP8 Conversion Verification Results")
+            fig_percent.savefig('fp8_verification_percentages.png', bbox_inches='tight', dpi=300)
+            plt.show()
+            
+            # Heatmap visualization
+            fig_heatmap = plotter.plot_heatmap()
+            fig_heatmap.savefig('fp8_verification_heatmap.png', bbox_inches='tight', dpi=300)
+            plt.show()
+            
+            # Distribution plots
+            fig_dist = plotter.plot_difference_distribution()
+            fig_dist.savefig('fp8_verification_distribution.png', bbox_inches='tight', dpi=300)
+            plt.show()
+            
+            # Layer comparison plot
+            fig_comp = plotter.plot_layer_comparison()
+            fig_comp.savefig('fp8_verification_comparison.png', bbox_inches='tight', dpi=300)
+            plt.show()
+            
+            # Summary statistics plot
+            fig_stats = plotter.plot_summary_statistics()
+            fig_stats.savefig('fp8_verification_stats.png', bbox_inches='tight', dpi=300)
+            plt.show()
+            
+            plt.close('all')
+        except Exception as e:
+            print(f"Error generating visualizations: {e}")
+        
         print("\n========= Completed process_weights =========")
         return processed
 
