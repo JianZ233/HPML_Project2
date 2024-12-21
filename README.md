@@ -156,10 +156,14 @@ Using a shard size of **4.0 GB** across two GPUs, **synchronous loading** comple
 
 ---
 
-### Quantization Accuracy
+### Quantization Accuracy Results
 For multi-layer perceptron layers, less than **3% of weights** deviated beyond an absolute threshold of **0.001** from original values, indicating high accuracy in quantization. However, attention and layer norm layers showed higher variance, with a mean deviation of **27.37%**. These findings highlight areas for further optimization in preserving accuracy across model components. 
 ![1-20-percentages](1-20-percentages.png "1-20-percentages")
 ![20-rest-percentages](20-rest-percentages.png "20-rest-percentages")
+
+Such a discrepancy can be explained by how the weight values for LayerNorm are generally very small values, and quantizing and dequantizing these weights leads to larger quantization error than MLP weights, which are generally larger in magnitude.
+
+We propose future work to explore the potential for a hybrid approach, combining relative and absolute tolerance levels to determine if particular tensors/weight values are truly exceeding tolerance levels.
 
 ## Contributing
 
