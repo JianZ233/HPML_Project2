@@ -153,10 +153,14 @@ Both GPUs retained over **17 GB of free memory** post-loading, demonstrating rob
 ### Loading Performance: Synchronous vs. Asynchronous
 Using a shard size of **4.0 GB** across two GPUs, **synchronous loading** completed in **136.64 seconds**, outperforming **asynchronous loading**, which took **147.22 seconds**. This suggests synchronous loading is more effective in environments with limited GPU counts, as it minimizes the overhead of asynchronous operation management.
 ![Synchronous vs. Asynchronous](Synchronous_vs_Asynchronous.png "Synchronous vs. Asynchronous")
+
 ---
 
 ### Quantization Accuracy
 For multi-layer perceptron layers, less than **3% of weights** deviated beyond an absolute threshold of **0.001** from original values, indicating high accuracy in quantization. However, attention and layer norm layers showed higher variance, with a mean deviation of **27.37%**. These findings highlight areas for further optimization in preserving accuracy across model components. 
+![1-20-percentages](1-20-percentages.png "1-20-percentages")
+![20-rest-percentages](20-rest-percentages.png "20-rest-percentages")
+
 ## Contributing
 
 Contributions are welcome! Please read our contributing guidelines and submit pull requests to our repository.
@@ -168,6 +172,8 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 ## Acknowledgments
 
 This project utilized the [Meta-Llama-3.1-8B-FP8](https://huggingface.co/neuralmagic/Meta-Llama-3.1-8B-FP8) model hosted on Hugging Face for testing and validation purposes. We thank Neural Magic for making this resource publicly available, enabling comprehensive evaluation of our model loader.
+
+We would also like to express our gratitude to **Dr. Kaoutar El Maghraoui**, our professor, and **IBM mentor Antoni Viros i Martin** for their invaluable guidance and support throughout this project.
 
 ## Citation
 
