@@ -136,7 +136,27 @@ try:
 except RuntimeError as e:
     print(f"Error loading model: {e}")
 ```
+## Experimental Results
 
+### Memory Efficiency Analysis
+We tested the library on two NVIDIA L4 GPUs (24GB VRAM each) using the LLAMA-3.1-8B-inducted model with FP8 quantization and sharded loading. The model was loaded in two phases, processing 423 tensors in the first shard and 315 in the second, with a total load time of **123.25 seconds**.
+
+**GPU Memory Usage**:
+- **GPU 0**: Peak usage of **7,157 MB** (31.8% of VRAM), allocated **3,829 MB**.
+- **GPU 1**: Peak usage of **5,332 MB** (22.2% of VRAM), allocated **5,332 MB**.
+
+Both GPUs retained over **17 GB of free memory** post-loading, demonstrating robust memory efficiency and capacity for additional workloads.
+![GPU Memory Usage](GPU_Memory_Usage.png "GPU Memory Usage")
+
+---
+
+### Loading Performance: Synchronous vs. Asynchronous
+Using a shard size of **4.0 GB** across two GPUs, **synchronous loading** completed in **136.64 seconds**, outperforming **asynchronous loading**, which took **147.22 seconds**. This suggests synchronous loading is more effective in environments with limited GPU counts, as it minimizes the overhead of asynchronous operation management.
+![Synchronous vs. Asynchronous](Synchronous_vs_Asynchronous.png "Synchronous vs. Asynchronous")
+---
+
+### Quantization Accuracy
+For multi-layer perceptron layers, less than **3% of weights** deviated beyond an absolute threshold of **0.001** from original values, indicating high accuracy in quantization. However, attention and layer norm layers showed higher variance, with a mean deviation of **27.37%**. These findings highlight areas for further optimization in preserving accuracy across model components. 
 ## Contributing
 
 Contributions are welcome! Please read our contributing guidelines and submit pull requests to our repository.
