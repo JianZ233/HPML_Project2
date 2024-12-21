@@ -74,11 +74,9 @@ class ByteVerification:
             if str(tensor2.dtype).startswith('torch.float8'):
                 tensor2 = tensor2.to(torch.float32)
             
-            # Prepare tensors
+            # Prepare tensors and verify shapes
             tensor1 = tensor1.detach().to(torch.float32).cpu()
             tensor2 = tensor2.detach().to(torch.float32).cpu()
-            
-            # Verify shapes
             if tensor1.shape != tensor2.shape:
                 raise ValueError(f"Shape mismatch: {tensor1.shape} vs {tensor2.shape}")
             
@@ -87,12 +85,11 @@ class ByteVerification:
             first_diff_element = -1
             first_diff_values = None
             
-            # Process in chunks
+            # chunking
             for start_idx in range(0, num_elements, self.chunk_size):
                 end_idx = min(start_idx + self.chunk_size, num_elements)
                 chunk_size = end_idx - start_idx
                 
-                # Prepare GPU data
                 chunk1 = tensor1.view(-1)[start_idx:end_idx].cuda().contiguous()
                 chunk2 = tensor2.view(-1)[start_idx:end_idx].cuda().contiguous()
                 arr1 = cp.asarray(chunk1)
@@ -127,11 +124,9 @@ class ByteVerification:
                         float(arr2[chunk_first_diff])
                     )
                 
-                # Cleanup
                 del chunk1, chunk2, arr1, arr2, abs_tol
                 torch.cuda.empty_cache()
             
-            # Calculate results
             diff_percentage = (total_differences / num_elements) * 100
             is_successful = diff_percentage <= 99.9
             
