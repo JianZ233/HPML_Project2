@@ -18,7 +18,7 @@ A high-performance library for loading and quantizing large language models usin
 - Python 3.8+
 - PyTorch 2.0+
 - CUDA 11.8+
-- GPUs with compute capability 7.0+
+- Newer GPUs with support for FP8 formats, such as NVIDIA H100, L4, or equivalent
 
 ```bash
 pip install torch>=2.0.0
