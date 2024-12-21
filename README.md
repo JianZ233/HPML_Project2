@@ -145,6 +145,10 @@ Contributions are welcome! Please read our contributing guidelines and submit pu
 
 This project is licensed under the MIT License - see the LICENSE file for details.
 
+## Acknowledgments
+
+This project utilized the [Meta-Llama-3.1-8B-FP8](https://huggingface.co/neuralmagic/Meta-Llama-3.1-8B-FP8) model hosted on Hugging Face for testing and validation purposes. We thank Neural Magic for making this resource publicly available, enabling comprehensive evaluation of our model loader.
+
 ## Citation
 
 If you use this library in your research, please cite:
